@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Marshal File Decoder/Decompiler
-This tool helps decode and decompile Python marshal files.
-Works on Termux and other Python environments.
+Marshal Decoder
+Specialized tool to decrypt/decode Python marshal data
+Focuses on handling marshal.loads() byte strings
 """
 
-import argparse
 import marshal
 import sys
 import os
@@ -13,6 +12,7 @@ import types
 import dis
 from io import StringIO
 import traceback
+import re
 import time
 
 # Default output file for successful decompilations
@@ -55,9 +55,8 @@ def print_banner():
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════╝{Colors.ENDC}
 
-{Colors.YELLOW}{Colors.BOLD}        Python Marshal Decompiler & Decoder Tool
-        Works with marshal, pyc, and pyo files
-        Supports lambda functions and nested code{Colors.ENDC}
+{Colors.YELLOW}{Colors.BOLD}         Python Marshal Decoder Tool
+         Decrypt marshal.loads() byte strings{Colors.ENDC}
 """
     print(banner)
 
@@ -70,6 +69,19 @@ def read_file(filename):
         print(f"{Colors.RED}Error reading file: {e}{Colors.ENDC}")
         return None
 
+def read_text_file(filename):
+    """Read the content of a text file to extract marshal data."""
+    try:
+        with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception:
+        try:
+            with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            print(f"{Colors.RED}Error reading file: {e}{Colors.ENDC}")
+            return None
+
 def save_content(content, filename):
     """Save content to a file."""
     try:
@@ -81,12 +93,95 @@ def save_content(content, filename):
         print(f"{Colors.RED}❌ Error saving file: {e}{Colors.ENDC}")
         return False
 
+def extract_marshal_data_from_text(text_content):
+    """Extract marshal byte data from Python code."""
+    # Look for common patterns of marshal data in Python code
+    patterns = [
+        r"marshal\.loads\(b['\"]([^'\"]+)['\"]",  # marshal.loads(b'...')
+        r"marshal\.loads\(b\"\"\"([^\"\"\"]+)\"\"\"",  # marshal.loads(b"""...""")
+        r"marshal\.loads\(bytes\(([^)]+)\)\)",  # marshal.loads(bytes(...))
+        r"exec\(marshal\.loads\(b['\"]([^'\"]+)['\"]",  # exec(marshal.loads(b'...'))
+        r"exec\(marshal\.loads\(b\"\"\"([^\"\"\"]+)\"\"\"",  # exec(marshal.loads(b"""..."""))
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text_content)
+        if matches:
+            print(f"{Colors.GREEN}✅ Found marshal data using pattern: {pattern}{Colors.ENDC}")
+            # Return the first match for now
+            return matches[0]
+    
+    print(f"{Colors.YELLOW}⚠️ Couldn't find marshal data using known patterns. Trying raw content...{Colors.ENDC}")
+    # If no patterns match, return the raw content (it might be direct binary data)
+    return text_content
+
+def convert_string_to_bytes(byte_str):
+    """Convert a string representation of bytes to actual bytes."""
+    try:
+        # If it's already bytes, return it
+        if isinstance(byte_str, bytes):
+            return byte_str
+        
+        # If it's an escape sequence string like '\xe3\x00\x00...'
+        if '\\x' in byte_str:
+            # Evaluate the string as Python code
+            try:
+                # This is safer than eval
+                result = bytes(int(x, 16) for x in byte_str.replace('\\x', ' ').split())
+                return result
+            except Exception:
+                # Try different approach
+                return eval(f"b'{byte_str}'")
+        
+        # Try direct encoding
+        return byte_str.encode('latin-1')
+    
+    except Exception as e:
+        print(f"{Colors.RED}❌ Error converting string to bytes: {e}{Colors.ENDC}")
+        print(f"{Colors.YELLOW}Trying alternative conversion methods...{Colors.ENDC}")
+        
+        try:
+            # Try to interpret as hex
+            if all(c in '0123456789abcdefABCDEF\\x' for c in byte_str.strip()):
+                cleaned = byte_str.replace('\\x', '')
+                return bytes.fromhex(cleaned)
+        except Exception:
+            pass
+            
+        try:
+            # Last resort - raw encoding
+            return byte_str.encode('raw_unicode_escape')
+        except Exception as e:
+            print(f"{Colors.RED}❌ All conversion methods failed: {e}{Colors.ENDC}")
+            return None
+
 def unmarshal_object(data):
     """Unmarshal the object from binary data."""
+    if isinstance(data, str):
+        data = convert_string_to_bytes(data)
+        
+    if not data:
+        return None
+        
     try:
         return marshal.loads(data)
     except Exception as e:
         print(f"{Colors.RED}❌ Error unmarshalling data: {e}{Colors.ENDC}")
+        
+        # Try to fix common issues with marshal data
+        try:
+            print(f"{Colors.YELLOW}Trying to fix marshal data format...{Colors.ENDC}")
+            # Sometimes data has extra characters at the beginning
+            for i in range(min(20, len(data))):
+                try:
+                    obj = marshal.loads(data[i:])
+                    print(f"{Colors.GREEN}✅ Successfully unmarshalled after skipping {i} bytes{Colors.ENDC}")
+                    return obj
+                except Exception:
+                    pass
+        except Exception:
+            pass
+            
         return None
 
 def handle_lambda_and_nested_code(obj, depth=0):
@@ -187,81 +282,47 @@ def decompile_code(code_obj):
         
         return output.getvalue()
 
-def process_pyc_file(filename):
-    """Process .pyc file which has marshal data after a header."""
-    with open(filename, 'rb') as f:
-        # Try multiple header sizes (for different Python versions)
-        for header_size in [4, 8, 12, 16]:
-            try:
-                f.seek(header_size)
-                data = f.read()
-                # Try to unmarshal and see if it works
-                try:
-                    marshal.loads(data)
-                    print(f"{Colors.GREEN}✅ Successfully detected PYC header size: {header_size} bytes{Colors.ENDC}")
-                    return data
-                except Exception:
-                    continue
-            except Exception:
-                continue
-        
-        # If we reached here, try a brute force approach
-        print(f"{Colors.YELLOW}⚠️ Warning: Could not automatically detect PYC header size{Colors.ENDC}")
-        print(f"{Colors.YELLOW}Trying brute force approach...{Colors.ENDC}")
-        
-        f.seek(0)
-        file_content = f.read()
-        
-        # Try to find marshal data by scanning through the file
-        for i in range(0, min(100, len(file_content))):
-            try:
-                data = file_content[i:]
-                marshal.loads(data)
-                print(f"{Colors.GREEN}✅ Found marshal data at offset: {i}{Colors.ENDC}")
-                return data
-            except Exception:
-                continue
-    
-    print(f"{Colors.RED}❌ Failed to find valid marshal data in the file{Colors.ENDC}")
-    return None
-
-def process_file(input_file, output_file=None, is_pyc=False, raw_mode=False, verbose=False):
-    """Process a single file with the given options."""
+def decrypt_marshal_from_file(file_path, output_file=None):
+    """Main function to decrypt marshal data from a file."""
     if not output_file:
         output_file = DEFAULT_SUCCESS_FILE
-        
-    print(f"{Colors.CYAN}🔍 Processing file: {input_file}{Colors.ENDC}")
     
-    # Read and process the file
-    data = read_file(input_file)
-    if data is None:
-        return False
+    print(f"{Colors.CYAN}🔍 Processing file: {file_path}{Colors.ENDC}")
     
-    # If it's a pyc file, extract marshal data
-    if is_pyc or input_file.endswith('.pyc') or input_file.endswith('.pyo'):
-        print(f"{Colors.CYAN}🔄 Treating file as PYC/PYO format...{Colors.ENDC}")
-        data = process_pyc_file(input_file)
-        if data is None:
+    # Check file extension
+    if file_path.endswith('.py') or file_path.endswith('.pyw') or file_path.endswith('.txt'):
+        # Text file - read and extract marshal data
+        content = read_text_file(file_path)
+        if not content:
             return False
+            
+        print(f"{Colors.CYAN}🔍 Searching for marshal data in text file...{Colors.ENDC}")
+        marshal_data = extract_marshal_data_from_text(content)
+    else:
+        # Binary file - read directly
+        marshal_data = read_file(file_path)
+    
+    if not marshal_data:
+        print(f"{Colors.RED}❌ Could not extract marshal data from file.{Colors.ENDC}")
+        return False
     
     # Unmarshal the data
     print(f"{Colors.CYAN}🔄 Unmarshalling data...{Colors.ENDC}")
-    unmarshalled = unmarshal_object(data)
-    if unmarshalled is None:
+    unmarshalled = unmarshal_object(marshal_data)
+    
+    if not unmarshalled:
+        print(f"{Colors.RED}❌ Failed to unmarshal data.{Colors.ENDC}")
         return False
     
-    if verbose:
-        print(f"{Colors.CYAN}📄 Unmarshalled object type: {type(unmarshalled)}{Colors.ENDC}")
-        print(f"{Colors.CYAN}📄 Co-names (if code object): {getattr(unmarshalled, 'co_names', 'N/A')}{Colors.ENDC}")
-        print(f"{Colors.CYAN}📄 Co-varnames (if code object): {getattr(unmarshalled, 'co_varnames', 'N/A')}{Colors.ENDC}")
+    print(f"{Colors.CYAN}📄 Unmarshalled object type: {type(unmarshalled)}{Colors.ENDC}")
     
-    # If raw is selected or if unmarshalled object is not a code object
-    if raw_mode or not isinstance(unmarshalled, types.CodeType):
-        print(f"{Colors.CYAN}📄 Unmarshalled object type: {type(unmarshalled)}{Colors.ENDC}")
-        if not isinstance(unmarshalled, types.CodeType):
-            print(f"{Colors.YELLOW}⚠️ Not a code object, cannot decompile.{Colors.ENDC}")
-            print(f"{Colors.CYAN}📄 Object value (repr): {repr(unmarshalled)}{Colors.ENDC}")
-            return False
+    # If not a code object
+    if not isinstance(unmarshalled, types.CodeType):
+        print(f"{Colors.YELLOW}⚠️ Not a code object, cannot decompile.{Colors.ENDC}")
+        obj_repr = repr(unmarshalled)
+        # Save raw representation
+        save_content(f"# Marshal Decoded Object (not a code object)\n# Type: {type(unmarshalled)}\n\n{obj_repr}", output_file)
+        return True
     
     # Decompile the code object
     print(f"{Colors.CYAN}🔄 Attempting to decompile...{Colors.ENDC}")
@@ -270,146 +331,131 @@ def process_file(input_file, output_file=None, is_pyc=False, raw_mode=False, ver
     # Output the result
     success = save_content(decompiled, output_file)
     
-    if success and (verbose or True):  # Always show a preview
-        preview_length = 800 if verbose else 400
+    if success:
+        preview_length = 400
         print(f"\n{Colors.GREEN}--- Decompiled Code Preview ---{Colors.ENDC}")
         print(decompiled[:preview_length] + (f"{Colors.YELLOW}...{Colors.ENDC}" if len(decompiled) > preview_length else ""))
         print(f"\n{Colors.GREEN}--- End of Preview ---{Colors.ENDC}")
-    
-    if success:
         print(f"{Colors.GREEN}✅ Decompilation completed successfully!{Colors.ENDC}")
         return True
+    
     return False
 
-def get_file_path():
-    """Get file path from user interactively."""
-    while True:
-        print(f"\n{Colors.CYAN}Enter the path to the marshal/pyc file to decompile:{Colors.ENDC}")
-        print(f"{Colors.YELLOW}(Type 'back' to return to main menu){Colors.ENDC}")
-        file_path = input(f"{Colors.BOLD}> {Colors.ENDC}").strip()
-        
-        if file_path.lower() == 'back':
-            return None
-            
-        if not os.path.exists(file_path):
-            print(f"{Colors.RED}❌ File does not exist. Please try again.{Colors.ENDC}")
-            continue
-            
-        return file_path
-
-def get_output_path(default_file=DEFAULT_SUCCESS_FILE):
-    """Get output file path from user interactively."""
-    print(f"\n{Colors.CYAN}Enter the output file path (press Enter for default: {default_file}):{Colors.ENDC}")
-    output_path = input(f"{Colors.BOLD}> {Colors.ENDC}").strip()
+def decrypt_marshal_from_string(marshal_string, output_file=None):
+    """Decrypt marshal data from a string."""
+    if not output_file:
+        output_file = DEFAULT_SUCCESS_FILE
     
-    if not output_path:
-        return default_file
-    return output_path
+    print(f"{Colors.CYAN}🔍 Processing marshal string...{Colors.ENDC}")
+    
+    # Unmarshal the data
+    print(f"{Colors.CYAN}🔄 Unmarshalling data...{Colors.ENDC}")
+    unmarshalled = unmarshal_object(marshal_string)
+    
+    if not unmarshalled:
+        print(f"{Colors.RED}❌ Failed to unmarshal data.{Colors.ENDC}")
+        return False
+    
+    print(f"{Colors.CYAN}📄 Unmarshalled object type: {type(unmarshalled)}{Colors.ENDC}")
+    
+    # If not a code object
+    if not isinstance(unmarshalled, types.CodeType):
+        print(f"{Colors.YELLOW}⚠️ Not a code object, cannot decompile.{Colors.ENDC}")
+        obj_repr = repr(unmarshalled)
+        # Save raw representation
+        save_content(f"# Marshal Decoded Object (not a code object)\n# Type: {type(unmarshalled)}\n\n{obj_repr}", output_file)
+        return True
+    
+    # Decompile the code object
+    print(f"{Colors.CYAN}🔄 Attempting to decompile...{Colors.ENDC}")
+    decompiled = decompile_code(unmarshalled)
+    
+    # Output the result
+    success = save_content(decompiled, output_file)
+    
+    if success:
+        preview_length = 400
+        print(f"\n{Colors.GREEN}--- Decompiled Code Preview ---{Colors.ENDC}")
+        print(decompiled[:preview_length] + (f"{Colors.YELLOW}...{Colors.ENDC}" if len(decompiled) > preview_length else ""))
+        print(f"\n{Colors.GREEN}--- End of Preview ---{Colors.ENDC}")
+        print(f"{Colors.GREEN}✅ Decompilation completed successfully!{Colors.ENDC}")
+        return True
+    
+    return False
 
-def interactive_menu():
-    """Interactive menu for the tool."""
+def get_input_choice():
+    """Get user choice for input method."""
     while True:
-        clear_screen()
-        print_banner()
+        print(f"\n{Colors.CYAN}Select input method:{Colors.ENDC}")
+        print(f"{Colors.CYAN}1. {Colors.ENDC}Enter marshal byte string directly")
+        print(f"{Colors.CYAN}2. {Colors.ENDC}Enter file path containing marshal data")
         
-        print(f"\n{Colors.BOLD}Select an option:{Colors.ENDC}")
-        print(f"{Colors.CYAN}1. {Colors.ENDC}Decompile a Marshal/PYC file")
-        print(f"{Colors.CYAN}2. {Colors.ENDC}Decompile with custom output file")
-        print(f"{Colors.CYAN}3. {Colors.ENDC}Decompile with verbose output")
-        print(f"{Colors.CYAN}4. {Colors.ENDC}Extract raw marshal data only")
-        print(f"{Colors.CYAN}5. {Colors.ENDC}About this tool")
-        print(f"{Colors.CYAN}6. {Colors.ENDC}Exit")
+        choice = input(f"\n{Colors.BOLD}Enter your choice [1-2]: {Colors.ENDC}")
         
-        choice = input(f"\n{Colors.BOLD}Enter your choice [1-6]: {Colors.ENDC}")
+        if choice in ['1', '2']:
+            return int(choice)
         
-        if choice == '1':
-            file_path = get_file_path()
-            if file_path:
-                process_file(file_path)
-                input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.ENDC}")
-        
-        elif choice == '2':
-            file_path = get_file_path()
-            if file_path:
-                output_path = get_output_path()
-                process_file(file_path, output_path)
-                input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.ENDC}")
-        
-        elif choice == '3':
-            file_path = get_file_path()
-            if file_path:
-                output_path = get_output_path()
-                process_file(file_path, output_path, verbose=True)
-                input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.ENDC}")
-        
-        elif choice == '4':
-            file_path = get_file_path()
-            if file_path:
-                process_file(file_path, raw_mode=True)
-                input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.ENDC}")
-        
-        elif choice == '5':
-            clear_screen()
-            print_banner()
-            print(f"\n{Colors.BOLD}About this tool:{Colors.ENDC}")
-            print(f"""
-{Colors.CYAN}This Marshal Decoder/Decompiler is designed to help you extract code
-from Python marshal files, PYC files, and other compiled Python objects.
+        print(f"{Colors.RED}Invalid choice. Please try again.{Colors.ENDC}")
 
-{Colors.GREEN}Features:{Colors.ENDC}
-- Decompiles Python code objects back to source code
-- Supports various Python versions
-- Automatically detects PYC file headers
-- Handles nested code objects and lambda functions
-- Supports list/dict comprehensions
-- Provides detailed code object metadata
-- Works in Termux Android environment
-
-{Colors.YELLOW}Limitations:{Colors.ENDC}
-- Cannot fully decompile heavily obfuscated code
-- Might produce incomplete results for newer Python versions
-- Some complex constructs may not decompile perfectly
-
-{Colors.BLUE}Created for educational and legitimate use only.{Colors.ENDC}
-            """)
-            input(f"\n{Colors.BOLD}Press Enter to return to main menu...{Colors.ENDC}")
-        
-        elif choice == '6':
-            clear_screen()
-            print(f"\n{Colors.GREEN}Thanks for using Marshal Decoder! Goodbye.{Colors.ENDC}")
-            sys.exit(0)
-        
+def get_marshal_string():
+    """Get marshal byte string from user."""
+    print(f"\n{Colors.CYAN}Enter marshal byte string (e.g. b'\\xe3\\x00\\x00...'):{Colors.ENDC}")
+    print(f"{Colors.YELLOW}(Paste the string and press Enter when done){Colors.ENDC}")
+    
+    marshal_string = input(f"{Colors.BOLD}> {Colors.ENDC}").strip()
+    
+    # Remove outer quotes if present
+    if marshal_string.startswith(('"', "'", 'b"', "b'")) and marshal_string.endswith(('"', "'")):
+        if marshal_string.startswith('b'):
+            marshal_string = marshal_string[2:-1]
         else:
-            print(f"{Colors.RED}Invalid choice. Please try again.{Colors.ENDC}")
-            time.sleep(1)
+            marshal_string = marshal_string[1:-1]
+    
+    return marshal_string
+
+def get_file_path():
+    """Get file path from user."""
+    print(f"\n{Colors.CYAN}Enter file path containing marshal data:{Colors.ENDC}")
+    
+    file_path = input(f"{Colors.BOLD}> {Colors.ENDC}").strip()
+    
+    if not os.path.exists(file_path):
+        print(f"{Colors.RED}❌ File does not exist. Please check the path.{Colors.ENDC}")
+        return None
+    
+    return file_path
 
 def main():
-    # Check if running with command-line arguments
-    if len(sys.argv) > 1:
-        # Command-line mode
-        parser = argparse.ArgumentParser(description="Decode/Decompile Marshal-encoded Python files")
-        parser.add_argument("input_file", nargs='?', help="Marshal encoded file to decode")
-        parser.add_argument("-o", "--output", help=f"Output file for decoded content (default: {DEFAULT_SUCCESS_FILE} on success)")
-        parser.add_argument("--pyc", action="store_true", help="Treat input as a .pyc file")
-        parser.add_argument("--raw", action="store_true", help="Just unmarshal, don't try to decompile")
-        parser.add_argument("--verbose", "-v", action="store_true", help="Show more detailed information")
-        parser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive menu mode")
-        
-        args = parser.parse_args()
-        
-        if args.interactive or not args.input_file:
-            interactive_menu()
-        else:
-            try:
-                process_file(args.input_file, args.output, args.pyc, args.raw, args.verbose)
-            except Exception as e:
-                print(f"{Colors.RED}❌ Error: {e}{Colors.ENDC}")
-                if args.verbose:
-                    traceback.print_exc()
-                sys.exit(1)
+    clear_screen()
+    print_banner()
+    
+    print(f"\n{Colors.BOLD}{Colors.GREEN}Marshal Decoder - Direct Decrypt{Colors.ENDC}")
+    print(f"{Colors.CYAN}This tool will decrypt and decompile Python marshal data.{Colors.ENDC}")
+    
+    # Get input choice
+    choice = get_input_choice()
+    
+    if choice == 1:
+        # Get marshal string
+        marshal_string = get_marshal_string()
+        if marshal_string:
+            output_file = DEFAULT_SUCCESS_FILE
+            decrypt_marshal_from_string(marshal_string, output_file)
     else:
-        # No arguments, run interactive mode
-        interactive_menu()
+        # Get file path
+        file_path = get_file_path()
+        if file_path:
+            output_file = DEFAULT_SUCCESS_FILE
+            decrypt_marshal_from_file(file_path, output_file)
+    
+    print(f"\n{Colors.BOLD}Process completed. Results saved to {DEFAULT_SUCCESS_FILE}{Colors.ENDC}")
+    input(f"\n{Colors.BOLD}Press Enter to exit...{Colors.ENDC}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Operation cancelled by user.{Colors.ENDC}")
+    except Exception as e:
+        print(f"\n{Colors.RED}An unexpected error occurred: {e}{Colors.ENDC}")
+        traceback.print_exc()
